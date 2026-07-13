@@ -106,8 +106,8 @@ def connect(s: Server) -> None:
     r = subprocess.run(
         ["sudo", "openvpn", "--config", str(OVPN), "--daemon",
          "--writepid", str(PIDFILE), "--log", str(LOGFILE),
-         # volunteer relays go dark often — fail fast instead of hanging:
-         "--connect-timeout", "10", "--connect-retry-max", "2"],
+         # one fast attempt per relay — the TUI fails over to the next candidate:
+         "--connect-timeout", "8", "--connect-retry-max", "1"],
     )
     if r.returncode != 0:
         raise VPNError(f"openvpn failed to launch (exit {r.returncode})")

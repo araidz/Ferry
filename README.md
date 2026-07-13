@@ -74,9 +74,10 @@ ones that get dropped.
 | Key | Action |
 | --- | --- |
 | `↑ ↓` | move within the focused pane |
-| `→` / `Enter` | countries → servers · connect to a server |
+| `→` | browse a country's servers |
+| `Enter` (on a country) | **auto-connect** the best working server, trying others if one stalls |
+| `Enter` (on a server) | connect that server, falling back to the rest of the country if it stalls |
 | `←` / `b` | back |
-| `Enter` | connect to the selected server |
 | `d` | disconnect |
 | `f` | favorite / unfavorite a server (pinned under ★ Favorites) |
 | `S` | cycle sort — score / ping / speed |
@@ -106,6 +107,12 @@ Ferry changes your **routes** — your public IP and apparent country. It does
 DNS queries may still use your local resolver. Fine for trivial uses; if you
 need leak-proof DNS or a kill-switch, use a full client. There is no per-app
 routing and no Windows/Linux support.
+
+**What's available:** VPN Gate's free pool is what you get — roughly 100
+volunteer relays across ~10–15 countries at any moment, weighted toward Asia
+(Japan, Korea), and it rotates. Ferry shows the current pool; press `r` (while
+you can reach vpngate — i.e. already connected) to pull the latest. There is no
+fixed country list to expand: the servers are whoever is volunteering right now.
 
 ## Privacy
 

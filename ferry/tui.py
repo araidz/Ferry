@@ -354,6 +354,8 @@ class App:
         self.connect_start = 0.0
         self.exit_info: tuple[str, str] | None = None
         self.user_disconnected = False
+        self.candidates: list[Server] = []  # failover queue for the current connect
+        self.cand_i = 0
         self.view = "browse"  # browse | status
         # browse navigation
         self.focus = "countries"
@@ -408,33 +410,67 @@ class App:
             vpn.sudo_refresh()  # keep the sudo ticket warm so connect never re-prompts
             self._last_refresh = now
         if self.conn == "connecting":
+            el = time.monotonic() - self.connect_start
             if vpn.connected():
-                self.conn = "connected"
+                self.conn, self.candidates = "connected", []
                 self.exit_info = vpn.exit_ip()  # one-shot; brief UI stall is fine
-            elif not vpn.alive() and time.monotonic() - self.connect_start > 2:
-                self.conn, self.status = "failed", vpn.log_error()
-            elif time.monotonic() - self.connect_start > 30:
-                self._do_disconnect(term)
-                self.conn, self.status = "failed", "timed out"
+            elif el > 3 and not vpn.alive():  # this relay's daemon exited — try the next
+                self._next_candidate(term)
+            elif el > 15:  # TCP up but handshake stalled — move on
+                self._next_candidate(term)
         elif self.conn == "connected" and not vpn.alive():
             if self.autoreconnect and not self.user_disconnected and self.active:
-                self._launch(term, self.active)
+                self._start_connect(term, self._pool_for(self.active), first=self.active)
             else:
                 self.conn, self.active, self.exit_info = "idle", None, None
                 self.view = "browse"
 
     # -- connection actions --------------------------------------------------
 
-    def _launch(self, term: Terminal, s: Server) -> None:
+    def _order(self, pool: list[Server], first: Server | None) -> list[Server]:
+        # friendly ports (443/995) first, then the active sort; `first` at the head.
+        # ponytail: cap the queue at 6 — trying more than that just stalls the UI.
+        ordered = sorted(pool, key=lambda s: (not s.friendly, SORTS[self.sort](s)))
+        if first is not None:
+            ordered = [first] + [s for s in ordered if s.host != first.host]
+        return ordered[:6]
+
+    def _pool_for(self, s: Server) -> list[Server]:
+        return [x for x in self.servers if x.cc == s.cc]
+
+    def _start_connect(self, term: Terminal, pool: list[Server],
+                       first: Server | None = None) -> None:
+        cands = self._order(pool, first)
+        if not cands:
+            self.status = "no servers to try"
+            return
+        self.candidates, self.cand_i, self.user_disconnected = cands, 0, False
+        self.view = "status"
+        self._launch_current(term)
+
+    def _launch_current(self, term: Terminal) -> None:
+        s = self.candidates[self.cand_i]
         with self._sudo_ctx(term):
             try:
                 vpn.connect(s)
                 self.conn, self.active = "connecting", s
                 self.connect_start = time.monotonic()
-                self.exit_info, self.user_disconnected = None, False
+                self.exit_info = None
             except vpn.VPNError as e:
                 self.conn, self.status = "failed", str(e)
-        self.view = "status"
+
+    def _next_candidate(self, term: Terminal) -> None:
+        with self._sudo_ctx(term):
+            vpn.disconnect()  # tear down the failed attempt before the next
+        if self.user_disconnected:
+            self.conn, self.candidates = "idle", []
+            return
+        self.cand_i += 1
+        if self.cand_i < len(self.candidates):
+            self._launch_current(term)
+        else:
+            self.conn = "failed"
+            self.status = f"no working server (tried {len(self.candidates)})"
 
     def _do_disconnect(self, term: Terminal) -> None:
         with self._sudo_ctx(term):
@@ -490,9 +526,11 @@ class App:
         elif k == "down":
             self.csel = (self.csel + 1) % n
             self.ssel = 0
-        elif k in ("right", "enter"):
+        elif k == "right":
             if self.current_servers():
                 self.focus = "servers"
+        elif k == "enter":  # auto-connect the best working server in this country
+            self._start_connect(term, self.current_servers())
 
     def _nav_servers(self, k: str, term: Terminal) -> None:
         pool = self.current_servers()
@@ -507,16 +545,16 @@ class App:
             if s:
                 self.favorites.symmetric_difference_update({s.host})
                 self.save()
-        elif k == "enter":
+        elif k == "enter":  # connect this one, fall back to the rest if it stalls
             s = self.current_server()
             if s:
-                self._launch(term, s)
+                self._start_connect(term, pool, first=s)
 
     def _on_key_status(self, k: str, term: Terminal) -> None:
         if k in ("d",) and self.conn in ("connected", "connecting"):
             self.user_disconnected = True
             self._do_disconnect(term)
-            self.conn, self.active, self.exit_info = "idle", None, None
+            self.conn, self.active, self.exit_info, self.candidates = "idle", None, None, []
             self.view = "browse"
         elif k in ("b", "left", "esc"):
             self.view = "browse"
@@ -546,7 +584,9 @@ def _conn_line(app: App) -> str:
         return (style(ON + " ", GOOD) + style("connected ", GOOD, bold=True)
                 + style(f"{where} · {ip}{cc} · {up}", TEXT))
     if app.conn == "connecting":
-        return style(BUSY + " connecting…", WARN, bold=True)
+        who = f" {app.active.host}" if app.active else ""
+        prog = f" ({app.cand_i + 1}/{len(app.candidates)})" if len(app.candidates) > 1 else ""
+        return style(f"{BUSY} connecting{who}{prog}…", WARN, bold=True)
     if app.conn == "failed":
         return style(OFF + " connect failed", BAD, bold=True)
     return style(OFF + " not connected", dim=True)
@@ -613,7 +653,9 @@ def _status_panel(app: App, width: int, height: int) -> list[str]:
         return "  " + cell(label, 10, dim=True) + cell(value, inner_w - 12, color=color)
 
     if app.conn == "connecting":
-        inner.append(cell("  connecting… (a few seconds; volunteer relays can be slow)", inner_w, color=WARN))
+        prog = f"  (trying {app.cand_i + 1} of {len(app.candidates)})" if len(app.candidates) > 1 else ""
+        who = f" to {app.active.host} {app.active.transport}" if app.active else ""
+        inner.append(cell(f"  connecting{who}…{prog}", inner_w, color=WARN))
     elif app.conn == "failed":
         inner.append(cell("  connect failed", inner_w, color=BAD, bold=True))
         inner.append(cell("  " + app.status, inner_w, dim=True))
@@ -641,9 +683,10 @@ def _status_panel(app: App, width: int, height: int) -> list[str]:
 
 def _help_panel(width: int, height: int) -> list[str]:
     keys = [
-        ("↑ ↓", "move"), ("→ / enter", "into servers · connect"),
-        ("← / b", "back"), ("enter", "connect to selected server"),
-        ("d", "disconnect"), ("f", "favorite server"),
+        ("↑ ↓", "move"), ("→", "browse a country's servers"),
+        ("enter", "on a country: auto-connect the best working server"),
+        ("enter", "on a server: connect it, fall back to others if it stalls"),
+        ("← / b", "back"), ("d", "disconnect"), ("f", "favorite server"),
         ("S", "cycle sort (score / ping / speed)"), ("a", "toggle auto-reconnect"),
         ("s", "show connection status"), ("r", "refresh server list"),
         ("?", "this help"), ("q", "quit"),
@@ -666,7 +709,7 @@ def _footer(app: App, width: int) -> str:
     elif app.view == "status":
         hints = [("d", "disconnect"), ("b", "back"), ("a", "reconnect"), ("?", "keys"), ("q", "quit")]
     elif app.focus == "countries":
-        hints = [("↑↓", "country"), ("→", "servers"), ("S", "sort"), ("a", "reconnect"),
+        hints = [("↑↓", "country"), ("↵", "auto-connect"), ("→", "servers"), ("S", "sort"),
                  ("r", "refresh"), ("?", "keys"), ("q", "quit")]
     else:
         hints = [("↑↓", "server"), ("↵", "connect"), ("f", "favorite"), ("←", "back"),

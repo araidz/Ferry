@@ -78,6 +78,18 @@ def test_vpn_no_process():
     assert isinstance(vpn.log_error(), str)
 
 
+def test_failover_order(servers):
+    app = App(servers)
+    ordered = app._order(servers, first=None)
+    assert len(ordered) <= 6
+    fr = [i for i, s in enumerate(ordered) if s.friendly]
+    nf = [i for i, s in enumerate(ordered) if not s.friendly]
+    if fr and nf:
+        assert max(fr) < min(nf), "friendly relays must be tried first"
+    pick = servers[-1]
+    assert app._order(servers, first=pick)[0].host == pick.host  # chosen server first
+
+
 def test_cache_backfill(servers):
     # an OLD cache (pre-transport) must still yield ports, recovered from configs
     import json
@@ -102,6 +114,7 @@ if __name__ == "__main__":
     test_sort(servers)
     test_grouping_and_favorites(servers)
     test_render_smoke(servers)
+    test_failover_order(servers)
     test_cache_backfill(servers)
     test_vpn_no_process()
     print("ok — all ferry self-checks passed")
