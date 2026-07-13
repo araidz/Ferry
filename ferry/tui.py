@@ -514,11 +514,11 @@ class App:
         elif k == "s" and self.conn in ("connected", "connecting"):
             self.view = "status"
         elif self.focus == "countries":
-            self._nav_countries(k)
+            self._nav_countries(k, term)
         else:
             self._nav_servers(k, term)
 
-    def _nav_countries(self, k: str) -> None:
+    def _nav_countries(self, k: str, term: Terminal) -> None:
         n = len(self.countries) + 1  # +1 for Favorites row
         if k == "up":
             self.csel = (self.csel - 1) % n

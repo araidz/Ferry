@@ -90,6 +90,28 @@ def test_failover_order(servers):
     assert app._order(servers, first=pick)[0].host == pick.host  # chosen server first
 
 
+
+def test_on_key_connect(servers):
+    # drive key dispatch through nav -> auto-connect with sudo/openvpn stubbed out;
+    # catches wiring bugs (e.g. a missing term arg) that pure-render tests miss.
+    import ferry.tui as tui
+    saved = tui.vpn.sudo_warm, tui.vpn.connect
+    tui.vpn.sudo_warm = lambda: True          # warm -> _sudo_ctx never touches term
+    tui.vpn.connect = lambda s: None          # no real openvpn
+    try:
+        app = App(servers)
+        for k in ("down", "up", "right", "left"):
+            app.on_key(k, None)               # navigation must not raise
+        app.focus, app.csel = "countries", 1
+        app.on_key("enter", None)             # auto-connect a country
+        assert app.conn == "connecting" and app.active is not None
+        app2 = App(servers)
+        app2.csel, app2.focus = 1, "servers"
+        app2.on_key("enter", None)            # connect a specific server
+        assert app2.conn == "connecting"
+    finally:
+        tui.vpn.sudo_warm, tui.vpn.connect = saved
+
 def test_cache_backfill(servers):
     # an OLD cache (pre-transport) must still yield ports, recovered from configs
     import json
@@ -115,6 +137,7 @@ if __name__ == "__main__":
     test_grouping_and_favorites(servers)
     test_render_smoke(servers)
     test_failover_order(servers)
+    test_on_key_connect(servers)
     test_cache_backfill(servers)
     test_vpn_no_process()
     print("ok — all ferry self-checks passed")
