@@ -78,10 +78,30 @@ def test_vpn_no_process():
     assert isinstance(vpn.log_error(), str)
 
 
+def test_cache_backfill(servers):
+    # an OLD cache (pre-transport) must still yield ports, recovered from configs
+    import json
+    import tempfile
+    from dataclasses import asdict
+    old = []
+    for s in servers:
+        d = asdict(s)
+        d.pop("proto"), d.pop("port")
+        old.append(d)
+    p = Path(tempfile.mkdtemp()) / "servers.json"
+    p.write_text(json.dumps(old))
+    vpngate.CACHE = p
+    loaded = vpngate.load_cache()
+    assert len(loaded) == len(servers)
+    assert all(s.port > 0 for s in loaded), "ports not recovered from config"
+    assert any(s.friendly for s in loaded)
+
+
 if __name__ == "__main__":
     servers = test_parse()
     test_sort(servers)
     test_grouping_and_favorites(servers)
     test_render_smoke(servers)
+    test_cache_backfill(servers)
     test_vpn_no_process()
     print("ok — all ferry self-checks passed")

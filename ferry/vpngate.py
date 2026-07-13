@@ -96,9 +96,21 @@ def fetch(timeout: float = 20.0) -> list[Server]:
 
 def load_cache() -> list[Server]:
     try:
-        return [Server(**d) for d in json.loads(CACHE.read_text())]
-    except (OSError, ValueError, TypeError):
+        # tolerate older caches missing keys; drop unknown keys defensively
+        rows = json.loads(CACHE.read_text())
+    except (OSError, ValueError):
         return []
+    fields = Server.__dataclass_fields__.keys()
+    out: list[Server] = []
+    for d in rows:
+        try:
+            s = Server(**{k: v for k, v in d.items() if k in fields})
+        except TypeError:
+            continue
+        if not s.port:  # old cache had no transport — recover it from the config
+            s.proto, s.port = _remote(s.config())
+        out.append(s)
+    return out
 
 
 def save_cache(servers: list[Server]) -> None:
