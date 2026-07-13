@@ -54,6 +54,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     app = App(servers, note)
+    # One password up front on the clean terminal; the loop keeps the ticket warm
+    # so connecting/disconnecting never prompt again this session.
+    print("openvpn needs root — enter your password once to unlock connecting:")
+    vpn.sudo_prime()
+
     term = Terminal()
     term.enter()
     try:

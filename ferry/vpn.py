@@ -35,6 +35,23 @@ def installed() -> str | None:
     return which("openvpn")
 
 
+def sudo_prime() -> bool:
+    """Ask for the sudo password once, up front, on a clean terminal. Returns
+    True if we now hold a ticket. Keeping it warm (sudo_refresh) then lets
+    connect/disconnect run without prompting again."""
+    return subprocess.run(["sudo", "-v"]).returncode == 0
+
+
+def sudo_warm() -> bool:
+    """True if the sudo ticket is still valid (no password needed right now)."""
+    return subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0
+
+
+def sudo_refresh() -> None:
+    """Extend the ticket without prompting; a no-op if it already expired."""
+    subprocess.run(["sudo", "-n", "-v"], capture_output=True)
+
+
 def _pid() -> int | None:
     try:
         return int(PIDFILE.read_text().strip())

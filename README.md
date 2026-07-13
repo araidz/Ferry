@@ -24,11 +24,11 @@ Ferry is a from-scratch Python TUI in the look and feel of its sibling
   █▀  █▄▄ █▀▄ █▀▄ ▀▄▀   <≈~~~
   ● connected  Japan · 219.100.37.109 (JP) · 12m           auto-reconnect on
   ──────────────────────────────────────────────────────────────────────────
-    ★ Favorites (2)      ╭─ Japan · score ─────────────────────────── (48) ─╮
-  ▌ Japan (48)           │ ❯ public-vpn-153       10 ms   248 Mbps   JP  ★  │
-    Korea Republic of…   │   vpn441877979         22 ms   180 Mbps   JP     │
-    United States (2)    │   ...                                            │
-    Australia (1)        ╰──────────────────────────────────────────────────╯
+    ★ Favorites (2)      ╭─ Japan · score ────────────────────────────── (48) ─╮
+  ▌ Japan (48)           │ ❯ public-vpn-153     tcp:443   10 ms  248 Mbps JP ★ │
+    Korea Republic of…   │   vpn441877979       udp:1479  22 ms  180 Mbps JP   │
+    United States (2)    │   ...                                               │
+    Australia (1)        ╰─────────────────────────────────────────────────────╯
   ↑↓ server · ↵ connect · f favorite · ← back · S sort · ? keys · q quit
 ```
 
@@ -62,8 +62,14 @@ Needs `openvpn` (`brew install openvpn`). Or run without building: `python3 -m f
 ## Usage
 
 `ferry` opens to a country rail beside a servers panel. Pick a country, pick a
-server, press Enter to connect. **openvpn runs as root, so connecting asks for
-your `sudo` password** (the TUI steps aside for the prompt, then returns).
+server, press Enter to connect. **openvpn runs as root, so ferry asks for your
+`sudo` password once at launch** and keeps that ticket warm for the session —
+connecting and disconnecting never prompt again.
+
+On a restrictive network (blocked VPN ports), prefer a relay whose transport
+shows **green** — `tcp:443` or `tcp:995` masquerade as HTTPS/POP3S and slip
+through most firewalls. Odd high ports (what you'll often see first) are the
+ones that get dropped.
 
 | Key | Action |
 | --- | --- |

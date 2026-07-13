@@ -28,6 +28,9 @@ def test_parse():
     assert "remote " in cfg and ("<ca>" in cfg or "ca " in cfg), cfg[:120]
     active = [ln.strip() for ln in cfg.splitlines() if ln.strip() and not ln.startswith(("#", ";"))]
     assert not any(ln.startswith("auth-user-pass") for ln in active)  # self-contained
+    assert all(s.port > 0 and s.proto in ("tcp", "udp") for s in servers)
+    assert any(s.friendly for s in servers)  # public-vpn-153 is on 443
+    assert servers[0].transport.startswith(servers[0].proto)
     return servers
 
 

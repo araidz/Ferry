@@ -176,3 +176,17 @@ shipped is leaner than the plan above:
 Verified: `tests/test_ferry.py` (parse/sort/group/render/vpn-state) passes;
 zipapp builds; `--help`/`--version` work; all three views render at exact size.
 Remaining: the live connect smoke test (needs sudo + a real relay).
+
+### Post-v0.1 (user-requested during first run)
+
+- **sudo once at launch, not per connect.** `vpn.sudo_prime()` (`sudo -v`) runs
+  on the clean terminal before the TUI; the poll loop refreshes with
+  `sudo -n -v` every 60s so the ticket never expires mid-session. Connect/
+  disconnect check `sudo -n true` first — warm → run in place (no screen
+  flicker), cold → drop out of the TUI so the prompt is visible.
+- **Transport column + firewall-friendly highlight.** Volunteer relays bind
+  random high ports that locked-down networks drop (the first connect failed on
+  `tcp:1609`, "Network is unreachable"). `proto`/`port` are now decoded from each
+  config at parse time, shown as `tcp:443` etc., and ports 443/992/995 render
+  green — the ones that pass a strict firewall. Makes "connect on a blocked
+  network" achievable by picking a green relay.

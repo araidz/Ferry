@@ -9,6 +9,7 @@ lifted verbatim from Trawl (proven, and shared house style).
 from __future__ import annotations
 
 import json
+import contextlib
 import os
 import re
 import select
@@ -358,6 +359,7 @@ class App:
         self.focus = "countries"
         self.csel = 0
         self.ssel = 0
+        self._last_refresh = 0.0
         self._rebuild_countries()
 
     # -- derived data --------------------------------------------------------
@@ -401,6 +403,10 @@ class App:
     # -- polling (called every tick by the run loop) -------------------------
 
     def tick(self, term: Terminal) -> None:
+        now = time.monotonic()
+        if now - self._last_refresh > 60:
+            vpn.sudo_refresh()  # keep the sudo ticket warm so connect never re-prompts
+            self._last_refresh = now
         if self.conn == "connecting":
             if vpn.connected():
                 self.conn = "connected"
@@ -420,7 +426,7 @@ class App:
     # -- connection actions --------------------------------------------------
 
     def _launch(self, term: Terminal, s: Server) -> None:
-        with term.suspend():
+        with self._sudo_ctx(term):
             try:
                 vpn.connect(s)
                 self.conn, self.active = "connecting", s
@@ -431,8 +437,12 @@ class App:
         self.view = "status"
 
     def _do_disconnect(self, term: Terminal) -> None:
-        with term.suspend():
+        with self._sudo_ctx(term):
             vpn.disconnect()
+
+    def _sudo_ctx(self, term: Terminal):
+        # warm ticket -> run in place (no screen flicker); cold -> drop out for the prompt
+        return contextlib.nullcontext() if vpn.sudo_warm() else term.suspend()
 
     # -- input ---------------------------------------------------------------
 
@@ -577,7 +587,7 @@ def _server_rows(app: App, inner_w: int, vis_h: int) -> list[str]:
         return [cell("  no servers — press f elsewhere to add favorites"
                      if app.csel == 0 else "  no servers", inner_w, dim=True)]
     top = _window(app.ssel, len(pool), vis_h)
-    name_w = max(10, inner_w - 8 - 11 - 5 - 3)  # ping(8) speed(11) cc(5) ptr(3)
+    name_w = max(8, inner_w - 10 - 8 - 10 - 5 - 3)  # port(10) ping(8) speed(10) cc(5) ptr(3)
     rows = []
     for i in range(top, min(top + vis_h, len(pool))):
         s = pool[i]
@@ -586,8 +596,10 @@ def _server_rows(app: App, inner_w: int, vis_h: int) -> list[str]:
         fav = style(STAR, WARN) if s.host in app.favorites else " "
         line = (ptr
                 + cell(s.host, name_w, color=ACCENT if sel else TEXT, bold=sel)
+                + cell(s.transport, 10, align="right", color=GOOD if s.friendly else None,
+                       bold=s.friendly)
                 + cell(fmt_ping(s.ping), 8, align="right", color=GOOD if 0 < s.ping < 80 else None)
-                + cell(fmt_speed(s.speed), 11, align="right")
+                + cell(fmt_speed(s.speed), 10, align="right")
                 + " " + cell(s.cc, 3) + fav)
         rows.append(line)
     return rows
@@ -601,7 +613,7 @@ def _status_panel(app: App, width: int, height: int) -> list[str]:
         return "  " + cell(label, 10, dim=True) + cell(value, inner_w - 12, color=color)
 
     if app.conn == "connecting":
-        inner.append(cell("  connecting… (sudo may have prompted)", inner_w, color=WARN))
+        inner.append(cell("  connecting… (a few seconds; volunteer relays can be slow)", inner_w, color=WARN))
     elif app.conn == "failed":
         inner.append(cell("  connect failed", inner_w, color=BAD, bold=True))
         inner.append(cell("  " + app.status, inner_w, dim=True))
@@ -618,6 +630,7 @@ def _status_panel(app: App, width: int, height: int) -> list[str]:
             inner.append(field("Uptime", fmt_uptime(time.monotonic() - app.connect_start)))
         inner.append(field("Ping", fmt_ping(s.ping)))
         inner.append(field("Speed", fmt_speed(s.speed)))
+        inner.append(field("Transport", s.transport, GOOD if s.friendly else None))
     inner.append(cell("", inner_w))
     inner.append(field("Reconnect", "on" if app.autoreconnect else "off",
                        GOOD if app.autoreconnect else None))
@@ -640,9 +653,9 @@ def _help_panel(width: int, height: int) -> list[str]:
     for k, v in keys:
         inner.append("  " + cell(k, 14, color=ACCENT, bold=True) + cell(v, inner_w - 16, dim=True))
     inner.append(cell("", inner_w))
-    inner.append(cell("  openvpn runs as root — connecting asks for your sudo password.",
-                      inner_w, dim=True))
-    inner.append(cell("  ferry only changes routes; DNS may still use your resolver.",
+    inner.append(cell("  green port (443 / 995) = best chance through a strict firewall.",
+                      inner_w, color=GOOD, dim=True))
+    inner.append(cell("  sudo is asked once at launch; ferry changes routes, not DNS.",
                       inner_w, dim=True))
     return _wrap_panel("Keys", inner, width, height, True)
 

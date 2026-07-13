@@ -9,7 +9,9 @@ Wire format (pinned against a live sample — tests/fixtures/vpngate_sample.csv)
     *
 
 Only rows whose last column (a base64 .ovpn, inline ca/cert/key, no user/pass)
-is non-empty are usable; the rest are L2TP/SSTP-only.
+is non-empty are usable; the rest are L2TP/SSTP-only. The transport (proto/port)
+lives inside that config, so we decode it once at parse time — restrictive
+networks only pass a few ports, and the UI needs the port to steer the user.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from . import STATE_DIR
 API = "https://www.vpngate.net/api/iphone/"
 UA = "Mozilla/5.0"  # vpngate serves an empty body to a blank User-Agent
 CACHE = STATE_DIR / "servers.json"
+FRIENDLY_PORTS = {443, 992, 995}  # HTTPS/POP3S-lookalikes — pass most firewalls
 
 
 @dataclass
@@ -38,9 +41,20 @@ class Server:
     cc: str  # 2-letter, e.g. "KR"
     sessions: int
     config_b64: str
+    proto: str = "tcp"  # from the config's `proto` line
+    port: int = 0  # from the config's `remote <ip> <port>` line
 
     def config(self) -> str:
         return base64.b64decode(self.config_b64).decode("utf-8", "replace")
+
+    @property
+    def friendly(self) -> bool:
+        """Port a locked-down network is likely to let through."""
+        return self.port in FRIENDLY_PORTS
+
+    @property
+    def transport(self) -> str:
+        return f"{self.proto}:{self.port}" if self.port else self.proto
 
 
 def _int(s: str) -> int:
@@ -50,14 +64,27 @@ def _int(s: str) -> int:
         return 0
 
 
+def _remote(cfg: str) -> tuple[str, int]:
+    proto, port = "tcp", 0
+    for ln in cfg.splitlines():
+        p = ln.split()
+        if len(p) >= 2 and p[0] == "proto":
+            proto = "udp" if "udp" in p[1] else "tcp"
+        elif len(p) >= 3 and p[0] == "remote":
+            port = _int(p[2])
+    return proto, port
+
+
 def parse(text: str) -> list[Server]:
     rows = [ln for ln in text.splitlines() if ln and not ln.startswith(("*", "#"))]
     out: list[Server] = []
     for f in csv.reader(rows):
         if len(f) < 15 or not f[14].strip():
             continue
-        out.append(Server(f[0], f[1], _int(f[2]), _int(f[3]), _int(f[4]),
-                           f[5], f[6], _int(f[7]), f[14]))
+        s = Server(f[0], f[1], _int(f[2]), _int(f[3]), _int(f[4]),
+                   f[5], f[6], _int(f[7]), f[14])
+        s.proto, s.port = _remote(s.config())
+        out.append(s)
     return out
 
 
