@@ -22,6 +22,7 @@ import unicodedata
 
 from . import STATE_DIR, __version__, vpn
 from .vpngate import Server
+from . import security
 
 # -- theme (Trawl's violet palette; wake motif instead of the net) -----------
 
@@ -57,9 +58,7 @@ SORTS = {"score": lambda s: -s.score, "ping": lambda s: (s.ping or 99999),
          "speed": lambda s: -s.speed}
 SORT_ORDER = ["score", "ping", "speed"]
 
-RAIL_W = 22
 MARGIN = 2
-GAP = 2
 
 # -- ANSI + width primitives (verbatim from Trawl) ---------------------------
 
@@ -170,32 +169,7 @@ def _logo_lines() -> list[str]:
     return out
 
 
-# -- panels (from Trawl) -----------------------------------------------------
-
-
-def _panel_top(title: str, width: int, count: str | None, bw: str) -> str:
-    label = f" {title} "
-    cnt = f" {count} " if count else ""
-    fill = max(0, width - 4 - dwidth(label) - dwidth(cnt))
-    return (style("╭─", bw) + style(label, ALT, bold=True) + style("─" * fill, bw)
-            + style(cnt, dim=True) + style("─╮", bw))
-
-
-def _panel_bottom(width: int, bw: str) -> str:
-    return style("╰" + "─" * (width - 2) + "╯", bw)
-
-
-def _side(line: str, bw: str) -> str:
-    return style("│", bw) + " " + line + " " + style("│", bw)
-
-
-def _wrap_panel(title: str, inner: list[str], width: int, height: int,
-                focused: bool, count: str | None = None) -> list[str]:
-    bw = ACCENT if focused else RULE
-    inner_w = width - 4
-    body_h = height - 2
-    rows = (inner + [cell("", inner_w)] * body_h)[:body_h]
-    return [_panel_top(title, width, count, bw)] + [_side(r, bw) for r in rows] + [_panel_bottom(width, bw)]
+LOGO = _logo_lines()  # cached once — the logo never changes
 
 
 def _window(sel: int, total: int, h: int) -> int:
@@ -347,7 +321,12 @@ class App:
         st = _load_state()
         self.favorites: set[str] = set(st.get("favorites", []))
         self.sort = st.get("sort") if st.get("sort") in SORTS else "score"
-        self.autoreconnect = bool(st.get("autoreconnect", False))
+        self.autoreconnect = bool(st.get("autoreconnect", True))
+        self.provider_i = st.get("provider_i", 0)
+        self.engine = vpn.Engine(st.get("engine", "openvpn"))
+        self.killswitch = bool(st.get("killswitch", False))
+        self.dns_protect = bool(st.get("dns_protect", False))
+        self._dns_service: str | None = None
         # connection
         self.conn = "idle"  # idle | connecting | connected | failed
         self.active: Server | None = None
@@ -356,12 +335,14 @@ class App:
         self.user_disconnected = False
         self.candidates: list[Server] = []  # failover queue for the current connect
         self.cand_i = 0
-        self.view = "browse"  # browse | status
         # browse navigation
         self.focus = "countries"
         self.csel = 0
         self.ssel = 0
         self._last_refresh = 0.0
+        self._cached_pool: list[Server] = []
+        self._cached_pool_key: tuple[int, str, int] = (-1, "", -1)
+        self._fav_gen = 0
         self._rebuild_countries()
 
     # -- derived data --------------------------------------------------------
@@ -379,12 +360,18 @@ class App:
         return rows
 
     def current_servers(self) -> list[Server]:
+        fgen = self._fav_gen
+        key = (self.csel, self.sort, fgen)
+        if self._cached_pool_key == key:
+            return self._cached_pool
         if self.csel == 0:  # Favorites row
             pool = [s for s in self.servers if s.host in self.favorites]
         else:
             (cc, name), _ = self.countries[self.csel - 1]
             pool = [s for s in self.servers if s.cc == cc]
-        return sorted(pool, key=SORTS[self.sort])
+        self._cached_pool = sorted(pool, key=SORTS[self.sort])
+        self._cached_pool_key = key
+        return self._cached_pool
 
     def current_server(self) -> Server | None:
         pool = self.current_servers()
@@ -398,6 +385,10 @@ class App:
             STATE_FILE.write_text(json.dumps({
                 "favorites": sorted(self.favorites), "sort": self.sort,
                 "autoreconnect": self.autoreconnect,
+                "provider_i": self.provider_i,
+                "engine": self.engine.value,
+                "killswitch": self.killswitch,
+                "dns_protect": self.dns_protect,
             }))
         except OSError:
             pass
@@ -411,48 +402,72 @@ class App:
             self._last_refresh = now
         if self.conn == "connecting":
             el = time.monotonic() - self.connect_start
-            if vpn.connected():
+            if vpn.connected(self.engine):
                 self.conn, self.candidates = "connected", []
-                self.exit_info = vpn.exit_ip()  # one-shot; brief UI stall is fine
-            elif el > 3 and not vpn.alive():  # this relay's daemon exited — try the next
+                self.exit_info = vpn.exit_ip()
+                # post-connect security wiring
+                if self.killswitch and self.active:
+                    security.killswitch_enable(self.active.ip, self.active.port,
+                                               self.active.proto)
+                if self.dns_protect:
+                    self._dns_service = security.dns_backup()
+                    security.dns_set(["1.1.1.1", "1.0.0.1"])
+                ok, ip, country = security.tunnel_verified(timeout=10)
+                if not ok and self.conn == "connected":
+                    self.status = "tunnel verification failed — traffic may leak"
+            elif el > 3 and not vpn.alive(self.engine):
                 self._next_candidate(term)
-            elif el > 15:  # TCP up but handshake stalled — move on
+            elif el > 15:
                 self._next_candidate(term)
-        elif self.conn == "connected" and not vpn.alive():
+        elif self.conn == "connected" and not vpn.alive(self.engine):
+            self._security_teardown()
             if self.autoreconnect and not self.user_disconnected and self.active:
-                self._start_connect(term, self._pool_for(self.active), first=self.active)
+                # retry the same server first, then fail over across the whole pool
+                self._start_connect(term, self.servers, first=self.active, count=12)
             else:
                 self.conn, self.active, self.exit_info = "idle", None, None
-                self.view = "browse"
 
     # -- connection actions --------------------------------------------------
 
-    def _order(self, pool: list[Server], first: Server | None) -> list[Server]:
-        # friendly ports (443/995) first, then the active sort; `first` at the head.
-        # ponytail: cap the queue at 6 — trying more than that just stalls the UI.
-        ordered = sorted(pool, key=lambda s: (not s.friendly, SORTS[self.sort](s)))
+    def _order(self, pool: list[Server], first: Server | None = None,
+               count: int = 6) -> list[Server]:
+        from .vpngate import composite_score
+        # firewall-friendly ports first (443/995 survive strict firewalls), then score
+        ordered = sorted(pool, key=lambda s: (not s.friendly, -composite_score(s)))
         if first is not None:
             ordered = [first] + [s for s in ordered if s.host != first.host]
-        return ordered[:6]
-
-    def _pool_for(self, s: Server) -> list[Server]:
-        return [x for x in self.servers if x.cc == s.cc]
+        return ordered[:count]
 
     def _start_connect(self, term: Terminal, pool: list[Server],
-                       first: Server | None = None) -> None:
-        cands = self._order(pool, first)
+                       first: Server | None = None, count: int = 6) -> None:
+        cands = self._order(pool, first, count)
         if not cands:
             self.status = "no servers to try"
             return
+        if self.conn in ("connected", "connecting"):
+            self._teardown_active(term)  # switching servers: drop the old tunnel first
+        self.status = f"probing {len(cands)} servers…"
+        healthy = self._healthy(cands)
+        cands = healthy or cands[:1]  # ponytail: try at least one even if the probe fails
         self.candidates, self.cand_i, self.user_disconnected = cands, 0, False
-        self.view = "status"
         self._launch_current(term)
+
+    def _healthy(self, cands: list[Server]) -> list[Server]:
+        """Parallel TCP reachability probe; reachable servers, fastest first."""
+        from concurrent.futures import ThreadPoolExecutor
+        def probe(s: Server) -> tuple[Server, int | None]:
+            return s, security.check_server_latency(s.ip, s.port)
+        with ThreadPoolExecutor(max_workers=min(len(cands), 16)) as ex:
+            results = list(ex.map(probe, cands))
+        healthy = [(s, ms) for s, ms in results if ms is not None]
+        healthy.sort(key=lambda t: (not t[0].friendly, t[1]))  # friendly first, then fastest
+        return [s for s, _ in healthy]
 
     def _launch_current(self, term: Terminal) -> None:
         s = self.candidates[self.cand_i]
         with self._sudo_ctx(term):
             try:
-                vpn.connect(s)
+                vpn.connect(s, self.engine)
                 self.conn, self.active = "connecting", s
                 self.connect_start = time.monotonic()
                 self.exit_info = None
@@ -474,11 +489,33 @@ class App:
 
     def _do_disconnect(self, term: Terminal) -> None:
         with self._sudo_ctx(term):
-            vpn.disconnect()
+            vpn.disconnect(self.engine)
 
     def _sudo_ctx(self, term: Terminal):
         # warm ticket -> run in place (no screen flicker); cold -> drop out for the prompt
         return contextlib.nullcontext() if vpn.sudo_warm() else term.suspend()
+
+    def _security_teardown(self) -> None:
+        # unwind kill switch / DNS overrides before a tunnel goes away
+        if self.killswitch:
+            security.killswitch_disable()
+        if self.dns_protect and self._dns_service:
+            security.dns_restore(self._dns_service)
+            self._dns_service = None
+
+    def _teardown_active(self, term: Terminal) -> None:
+        """Drop the live/attempting tunnel and its security wiring; ferry keeps running."""
+        self.user_disconnected = True
+        self._security_teardown()
+        self._do_disconnect(term)
+        self.conn, self.active, self.exit_info, self.candidates = "idle", None, None, []
+
+    def auto_connect(self, term: Terminal) -> None:
+        """One key: pick and connect the best working server anywhere."""
+        if not self.servers:
+            self.status = "no servers — press r to refresh"
+            return
+        self._start_connect(term, self.servers, count=12)
 
     # -- input ---------------------------------------------------------------
 
@@ -486,55 +523,64 @@ class App:
         if self.help:
             self.help = False
             return
-        if k == "ctrl-c":
+        if k in ("ctrl-c", "q"):
             self.running = False
-            return
-        if k in ("?",):
+        elif k == "?":
             self.help = True
-            return
-        if k == "a":
+        elif k == "d":  # disconnect but keep ferry running
+            if self.conn in ("connected", "connecting"):
+                self._teardown_active(term)
+                self.status = "disconnected"
+        elif k == "c":  # auto-connect the best working server anywhere
+            self.auto_connect(term)
+        elif k == "r":
+            self._refetch()
+        elif k == "a":
             self.autoreconnect = not self.autoreconnect
             self.status = f"auto-reconnect {'on' if self.autoreconnect else 'off'}"
             self.save()
-            return
-        if self.view == "status":
-            self._on_key_status(k, term)
-        else:
-            self._on_key_browse(k, term)
-
-    def _on_key_browse(self, k: str, term: Terminal) -> None:
-        if k == "q":
-            self.running = False
-        elif k == "r":
-            self._refetch()
         elif k == "S":
             self.sort = SORT_ORDER[(SORT_ORDER.index(self.sort) + 1) % len(SORT_ORDER)]
             self.ssel = 0
             self.save()
-        elif k == "s" and self.conn in ("connected", "connecting"):
-            self.view = "status"
+        elif k == "P":
+            from . import get_providers
+            self.provider_i = (self.provider_i + 1) % len(get_providers())
+            self._refetch()
+        elif k == "E" and vpn.wg_installed():
+            self.engine = (vpn.Engine.WIREGUARD if self.engine == vpn.Engine.OPENVPN
+                           else vpn.Engine.OPENVPN)
+            self.status = f"engine: {self.engine.value}"
+            self.save()
+        elif k == "k":
+            self.killswitch = not self.killswitch
+            self.status = f"kill switch: {'on' if self.killswitch else 'off'}"
+            self.save()
+        elif k == "n":
+            self.dns_protect = not self.dns_protect
+            self.status = f"dns protection: {'on' if self.dns_protect else 'off'}"
+            self.save()
         elif self.focus == "countries":
             self._nav_countries(k, term)
         else:
             self._nav_servers(k, term)
 
     def _nav_countries(self, k: str, term: Terminal) -> None:
-        n = len(self.countries) + 1  # +1 for Favorites row
+        n = len(self.countries) + 1  # +1 for the Favorites row
         if k == "up":
             self.csel = (self.csel - 1) % n
             self.ssel = 0
         elif k == "down":
             self.csel = (self.csel + 1) % n
             self.ssel = 0
-        elif k == "right":
+        elif k in ("right", "enter"):  # open the country's server list
             if self.current_servers():
                 self.focus = "servers"
-        elif k == "enter":  # auto-connect the best working server in this country
-            self._start_connect(term, self.current_servers())
+                self.ssel = 0
 
     def _nav_servers(self, k: str, term: Terminal) -> None:
         pool = self.current_servers()
-        if k == "left":
+        if k in ("left", "b", "esc"):
             self.focus = "countries"
         elif k == "up":
             self.ssel = (self.ssel - 1) % len(pool) if pool else 0
@@ -544,30 +590,22 @@ class App:
             s = self.current_server()
             if s:
                 self.favorites.symmetric_difference_update({s.host})
+                self._fav_gen += 1
                 self.save()
-        elif k == "enter":  # connect this one, fall back to the rest if it stalls
+        elif k == "enter":  # connect this server (switches if already connected)
             s = self.current_server()
             if s:
                 self._start_connect(term, pool, first=s)
 
-    def _on_key_status(self, k: str, term: Terminal) -> None:
-        if k in ("d",) and self.conn in ("connected", "connecting"):
-            self.user_disconnected = True
-            self._do_disconnect(term)
-            self.conn, self.active, self.exit_info, self.candidates = "idle", None, None, []
-            self.view = "browse"
-        elif k in ("b", "left", "esc"):
-            self.view = "browse"
-        elif k == "q":
-            self.running = False
-
     def _refetch(self) -> None:
-        from . import vpngate
+        from . import get_providers, vpngate
         try:
-            self.servers = vpngate.fetch()
+            providers = get_providers()
+            provider = providers[self.provider_i % len(providers)]
+            self.servers = provider.fetch()
             vpngate.save_cache(self.servers)
             self._rebuild_countries()
-            self.status = f"refreshed — {len(self.servers)} servers"
+            self.status = f"refreshed — {len(self.servers)} servers ({provider.name})"
         except Exception as e:  # noqa: BLE001
             self.status = f"refresh failed: {e}"
 
@@ -575,14 +613,14 @@ class App:
 # -- render ------------------------------------------------------------------
 
 
-def _conn_line(app: App) -> str:
+def _status_line(app: App) -> str:
     if app.conn == "connected" and app.active:
         where = app.active.country
         ip = app.exit_info[0] if app.exit_info else app.active.ip
         cc = f" ({app.exit_info[1]})" if app.exit_info else ""
         up = fmt_uptime(time.monotonic() - app.connect_start)
-        return (style(ON + " ", GOOD) + style("connected ", GOOD, bold=True)
-                + style(f"{where} · {ip}{cc} · {up}", TEXT))
+        return (style(ON + " connected", GOOD, bold=True)
+                + style(f"   {where} · {ip}{cc} · {up}", TEXT))
     if app.conn == "connecting":
         who = f" {app.active.host}" if app.active else ""
         prog = f" ({app.cand_i + 1}/{len(app.candidates)})" if len(app.candidates) > 1 else ""
@@ -593,127 +631,112 @@ def _conn_line(app: App) -> str:
 
 
 def _header(app: App, width: int) -> list[str]:
-    out = [" " * MARGIN + ln for ln in _logo_lines()]
-    right = ""
+    out = [" " * MARGIN + ln for ln in LOGO]
+    out.append("")
+    left = " " * MARGIN + _status_line(app)
     if not vpn.installed():
         right = style("openvpn missing — brew install openvpn", BAD)
-    elif app.autoreconnect:
-        right = style("auto-reconnect on", ALT, dim=True)
-    left = " " * MARGIN + _conn_line(app)
+    else:
+        tags = [t for t, on in (("auto-reconnect", app.autoreconnect),
+                                ("kill-switch", app.killswitch),
+                                ("dns-guard", app.dns_protect)) if on]
+        right = style(" · ".join(tags), ALT, dim=True) if tags else ""
     gap = max(1, width - dwidth(strip_ansi(left)) - dwidth(strip_ansi(right)) - MARGIN)
     out.append(left + " " * gap + right)
     out.append(" " * MARGIN + style("─" * (width - 2 * MARGIN), RULE))
     return out
 
 
-def _rail(app: App, h: int) -> list[str]:
-    rows = app._rail_rows()
+def _country_rows(app: App, width: int, h: int) -> list[str]:
+    rows = app._rail_rows()  # [(name, count)], Favorites first
     top = _window(app.csel, len(rows), h)
     out = []
     for i in range(top, min(top + h, len(rows))):
         name, n = rows[i]
         sel = i == app.csel
-        star = STAR + " " if i == 0 else ""
-        mark = style("▌", ACCENT, bold=True) if sel else " "
-        label = f"{star}{name} ({n})"
-        color = ACCENT if sel else (WARN if i == 0 else None)
-        out.append(mark + " " + cell(label, RAIL_W - 2, color=color, bold=sel, dim=not sel and i != 0))
-    return (out + [cell("", RAIL_W)] * h)[:h]
+        ptr = style(PTR + " ", ACCENT, bold=True) if sel else "  "
+        star = style(STAR + " ", WARN) if i == 0 else ""
+        color = ACCENT if sel else (WARN if i == 0 else TEXT)
+        namew = max(8, width - 2 * MARGIN - 2 - dwidth(str(n)) - 1)
+        line = ptr + cell(star + name, namew, color=color, bold=sel) + " " + style(str(n), dim=True)
+        out.append(" " * MARGIN + line)
+    return out
 
 
-def _server_rows(app: App, inner_w: int, vis_h: int) -> list[str]:
+def _server_rows(app: App, width: int, h: int) -> list[str]:
     pool = app.current_servers()
+    country = "Favorites" if app.csel == 0 else app.countries[app.csel - 1][0][1]
+    head = (" " * MARGIN + style(country, ACCENT, bold=True)
+            + style(f"   {len(pool)} server{'' if len(pool) == 1 else 's'} · sort: {app.sort}", dim=True))
     if not pool:
-        return [cell("  no servers — press f elsewhere to add favorites"
-                     if app.csel == 0 else "  no servers", inner_w, dim=True)]
-    top = _window(app.ssel, len(pool), vis_h)
-    name_w = max(8, inner_w - 10 - 8 - 10 - 5 - 3)  # port(10) ping(8) speed(10) cc(5) ptr(3)
-    rows = []
-    for i in range(top, min(top + vis_h, len(pool))):
+        empty = ("  no favorites yet — press f on a server to pin it"
+                 if app.csel == 0 else "  no servers here")
+        return [head, "", " " * MARGIN + style(empty, dim=True)]
+    top = _window(app.ssel, len(pool), h - 1)
+    inner = width - 2 * MARGIN
+    namew = max(8, inner - 2 - 9 - 7 - 10 - 2)  # ptr(2) transport(9) ping(7) speed(10) star(2)
+    out = [head]
+    for i in range(top, min(top + (h - 1), len(pool))):
         s = pool[i]
-        sel = i == app.ssel and app.focus == "servers"
-        ptr = style(PTR, ACCENT, bold=True) + " " if sel else "  "
-        fav = style(STAR, WARN) if s.host in app.favorites else " "
-        line = (ptr
-                + cell(s.host, name_w, color=ACCENT if sel else TEXT, bold=sel)
-                + cell(s.transport, 10, align="right", color=GOOD if s.friendly else None,
-                       bold=s.friendly)
-                + cell(fmt_ping(s.ping), 8, align="right", color=GOOD if 0 < s.ping < 80 else None)
-                + cell(fmt_speed(s.speed), 10, align="right")
-                + " " + cell(s.cc, 3) + fav)
-        rows.append(line)
-    return rows
-
-
-def _status_panel(app: App, width: int, height: int) -> list[str]:
-    inner_w = width - 4
-    inner: list[str] = [cell("", inner_w)]
-
-    def field(label: str, value: str, color: str | None = None) -> str:
-        return "  " + cell(label, 10, dim=True) + cell(value, inner_w - 12, color=color)
-
-    if app.conn == "connecting":
-        prog = f"  (trying {app.cand_i + 1} of {len(app.candidates)})" if len(app.candidates) > 1 else ""
-        who = f" to {app.active.host} {app.active.transport}" if app.active else ""
-        inner.append(cell(f"  connecting{who}…{prog}", inner_w, color=WARN))
-    elif app.conn == "failed":
-        inner.append(cell("  connect failed", inner_w, color=BAD, bold=True))
-        inner.append(cell("  " + app.status, inner_w, dim=True))
-    s = app.active
-    if s:
-        inner.append(cell("", inner_w))
-        inner.append(field("Server", s.host, ACCENT if app.conn == "connected" else None))
-        inner.append(field("Country", f"{s.country} ({s.cc})"))
-        if app.exit_info:
-            inner.append(field("Exit IP", f"{app.exit_info[0]}  [{app.exit_info[1]}]", GOOD))
+        sel = i == app.ssel
+        active = (app.active is not None and s.host == app.active.host
+                  and app.conn in ("connected", "connecting"))
+        if sel:
+            ptr = style(PTR + " ", ACCENT, bold=True)
+        elif active:
+            ptr = style(ON + " ", GOOD, bold=True)
         else:
-            inner.append(field("Exit IP", s.ip))
-        if app.conn == "connected":
-            inner.append(field("Uptime", fmt_uptime(time.monotonic() - app.connect_start)))
-        inner.append(field("Ping", fmt_ping(s.ping)))
-        inner.append(field("Speed", fmt_speed(s.speed)))
-        inner.append(field("Transport", s.transport, GOOD if s.friendly else None))
-    inner.append(cell("", inner_w))
-    inner.append(field("Reconnect", "on" if app.autoreconnect else "off",
-                       GOOD if app.autoreconnect else None))
-    title = {"connected": "Connected", "connecting": "Connecting",
-             "failed": "Failed"}.get(app.conn, "Status")
-    return _wrap_panel(title, inner, width, height, True)
+            ptr = "  "
+        star = style(STAR, WARN) if s.host in app.favorites else " "
+        host_color = ACCENT if sel else (GOOD if active else TEXT)
+        line = (ptr
+                + cell(s.host, namew, color=host_color, bold=sel or active)
+                + cell(s.transport, 9, align="right", color=GOOD if s.friendly else None,
+                       bold=s.friendly)
+                + cell(fmt_ping(s.ping), 7, align="right", color=GOOD if 0 < s.ping < 80 else None)
+                + cell(fmt_speed(s.speed), 10, align="right")
+                + " " + star)
+        out.append(" " * MARGIN + line)
+    return out
 
 
-def _help_panel(width: int, height: int) -> list[str]:
+def _help(app: App, width: int) -> list[str]:
     keys = [
-        ("↑ ↓", "move"), ("→", "browse a country's servers"),
-        ("enter", "on a country: auto-connect the best working server"),
-        ("enter", "on a server: connect it, fall back to others if it stalls"),
-        ("← / b", "back"), ("d", "disconnect"), ("f", "favorite server"),
-        ("S", "cycle sort (score / ping / speed)"), ("a", "toggle auto-reconnect"),
-        ("s", "show connection status"), ("r", "refresh server list"),
-        ("?", "this help"), ("q", "quit"),
+        ("↑ ↓", "move"),
+        ("↵", "open a country · connect a server"),
+        ("←", "back to the country list"),
+        ("c", "auto-connect the best server anywhere"),
+        ("d", "disconnect (ferry keeps running)"),
+        ("f", "favorite / unfavorite a server"),
+        ("r", "refresh the server list"),
+        ("S", "cycle sort — score / ping / speed"),
+        ("a", "auto-reconnect if the tunnel drops"),
+        ("k", "kill switch"),
+        ("n", "DNS-leak protection"),
+        ("P", "cycle provider"),
+        ("?", "close this help"),
+        ("q", "quit (disconnects any tunnel)"),
     ]
-    inner_w = width - 4
-    inner = [cell("", inner_w)]
+    out = [" " * MARGIN + style("Keys", ACCENT, bold=True), ""]
     for k, v in keys:
-        inner.append("  " + cell(k, 14, color=ACCENT, bold=True) + cell(v, inner_w - 16, dim=True))
-    inner.append(cell("", inner_w))
-    inner.append(cell("  green port (443 / 995) = best chance through a strict firewall.",
-                      inner_w, color=GOOD, dim=True))
-    inner.append(cell("  sudo is asked once at launch; ferry changes routes, not DNS.",
-                      inner_w, dim=True))
-    return _wrap_panel("Keys", inner, width, height, True)
+        out.append(" " * MARGIN + "  " + cell(k, 8, color=ACCENT, bold=True) + style(v, dim=True))
+    out.append("")
+    out.append(" " * MARGIN + style("green transport (443 / 995) slips through strict firewalls.",
+                                     GOOD, dim=True))
+    return out
 
 
 def _footer(app: App, width: int) -> str:
     if app.help:
         hints = [("any key", "close")]
-    elif app.view == "status":
-        hints = [("d", "disconnect"), ("b", "back"), ("a", "reconnect"), ("?", "keys"), ("q", "quit")]
-    elif app.focus == "countries":
-        hints = [("↑↓", "country"), ("↵", "auto-connect"), ("→", "servers"), ("S", "sort"),
-                 ("r", "refresh"), ("?", "keys"), ("q", "quit")]
     else:
-        hints = [("↑↓", "server"), ("↵", "connect"), ("f", "favorite"), ("←", "back"),
-                 ("S", "sort"), ("?", "keys"), ("q", "quit")]
+        if app.focus == "countries":
+            hints = [("↑↓", "move"), ("↵", "open"), ("c", "auto-connect")]
+        else:
+            hints = [("↑↓", "move"), ("↵", "connect"), ("←", "back"), ("f", "fav")]
+        if app.conn in ("connected", "connecting"):
+            hints.append(("d", "disconnect"))
+        hints += [("?", "keys"), ("q", "quit")]
     out, used = "", 0
     if app.status and not app.help:
         st = dtrunc(app.status, max(10, width // 2))
@@ -721,51 +744,31 @@ def _footer(app: App, width: int) -> str:
         used = dwidth(st) + 3
     sep = "  " + DOT + "  "
     sep_w = dwidth(sep)
-    last = hints[-1]
-    last_w = sep_w + dwidth(last[0]) + 1 + dwidth(last[1])
     first = True
-    for k, v in hints[:-1]:
+    for k, v in hints:
         add = dwidth(k) + 1 + dwidth(v) + (0 if first else sep_w)
-        if used + add + last_w > width:
+        if used + add > width - MARGIN:
             break
         if not first:
             out += style(sep, dim=True)
         out += style(k, ACCENT) + style(" " + v, dim=True)
         used += add
         first = False
-    if not first:
-        out += style(sep, dim=True)
-    out += style(last[0], ACCENT) + style(" " + last[1], dim=True)
     return " " * MARGIN + out
 
 
 def render(app: App, cols: int, rows: int) -> list[str]:
     width = max(40, cols)
     header = _header(app, width)
-    body_h = max(3, rows - len(header) - 3)
-    body: list[str]
-
+    body_h = max(3, rows - len(header) - 2)  # one blank above, footer below
     if app.help:
-        body = _help_panel(min(width - 2 * MARGIN, 72), body_h)
-        body = [" " * MARGIN + ln for ln in body]
-    elif app.view == "status":
-        pw = min(width - 2 * MARGIN, 60)
-        body = [" " * MARGIN + ln for ln in _status_panel(app, pw, body_h)]
-    else:  # browse — rail beside servers panel
-        rail = _rail(app, body_h)
-        panel_w = width - 2 * MARGIN - RAIL_W - GAP
-        inner_w = panel_w - 4
-        name = "Favorites" if app.csel == 0 else app.countries[app.csel - 1][0][1]
-        title = f"{name} · {app.sort}"
-        srows = _server_rows(app, inner_w, body_h - 2)
-        panel = _wrap_panel(title, srows, panel_w, body_h, app.focus == "servers",
-                            count=f"({len(app.current_servers())})")
-        body = []
-        for i in range(body_h):
-            r = rail[i] if i < len(rail) else cell("", RAIL_W)
-            p = panel[i] if i < len(panel) else ""
-            body.append(" " * MARGIN + r + " " * GAP + p)
-
+        body = _help(app, width)
+    elif app.focus == "countries":
+        body = _country_rows(app, width, body_h)
+    else:
+        body = _server_rows(app, width, body_h)
     footer = _footer(app, width)
-    out = header + [""] + body + [""] + [footer]
-    return out[:rows] + [""] * max(0, rows - len(out))
+    out = (header + [""] + body)[:rows - 1]
+    out += [""] * max(0, rows - 1 - len(out))
+    out.append(footer)
+    return out

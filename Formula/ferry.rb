@@ -1,7 +1,7 @@
 class Ferry < Formula
   desc "Connect to free VPN Gate servers from a terminal TUI"
   homepage "https://github.com/araidz/Ferry"
-  url "https://github.com/araidz/Ferry/archive/refs/tags/v0.1.0.tar.gz"
+  url "https://github.com/araidz/Ferry/archive/refs/tags/v0.3.0.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 

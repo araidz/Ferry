@@ -1,33 +1,36 @@
 """ferry entry point + run loop.
 
-Fetch the VPN Gate list once (plain stdout, before raw mode), then single
--threaded loop: poll stdin, poll the connection state, full-redraw. openvpn does
-the tunnelling in its own root process; on quit we tear any tunnel down.
+Fetch the server list once (plain stdout, before raw mode), then single
+-threaded loop: poll stdin, poll the connection state, full-redraw. openvpn/wireguard
+does the tunnelling in its own root process; on quit we tear any tunnel down.
 """
 
 from __future__ import annotations
 
 import sys
 
-from . import __version__, vpn, vpngate
-from .tui import App, Terminal, render
+from . import __version__, vpn, vpngate, security
+from .tui import App, Terminal, render, _load_state
 
-HELP = ("ferry — connect to free VPN Gate servers from a terminal.\n"
-        "  ferry            browse countries, pick a server, connect\n"
+HELP = ("ferry — connect to free VPN servers from a terminal.\n"
+        "  ferry            open the picker — ↵ to connect, c to auto-connect\n"
         "  ferry --version  print version\n\n"
         "openvpn must be installed (brew install openvpn) and runs as root,\n"
         "so connecting asks for your sudo password.")
 
 
-def load_servers() -> tuple[list[vpngate.Server], str | None]:
-    print("Fetching VPN Gate server list…", flush=True)
+def load_servers(provider_i: int = 0) -> tuple[list[vpngate.Server], str | None]:
+    from . import get_providers
+    providers = get_providers()
+    provider = providers[provider_i % len(providers)]
+    print(f"Fetching {provider.name} server list…", flush=True)
     try:
-        servers = vpngate.fetch()
+        servers = provider.fetch()
         vpngate.save_cache(servers)
         return servers, None
     except Exception as e:  # noqa: BLE001
         cached = vpngate.load_cache()
-        note = None if cached else f"vpngate unreachable: {e}"
+        note = None if cached else f"{provider.name} unreachable: {e}"
         if cached:
             note = f"offline — showing {len(cached)} cached servers"
         return cached, note
@@ -48,7 +51,9 @@ def main(argv: list[str] | None = None) -> int:
         print("openvpn not found. Install it with:  brew install openvpn")
         return 1
 
-    servers, note = load_servers()
+    st = _load_state()
+    provider_i = st.get("provider_i", 0)
+    servers, note = load_servers(provider_i)
     if not servers:
         print(note or "no servers available.")
         return 1
@@ -58,6 +63,9 @@ def main(argv: list[str] | None = None) -> int:
     # so connecting/disconnecting never prompt again this session.
     print("openvpn needs root — enter your password once to unlock connecting:")
     vpn.sudo_prime()
+
+    if vpn.wg_installed():
+        print("wireguard-tools detected — press E in the TUI to switch engines")
 
     term = Terminal()
     term.enter()
@@ -78,7 +86,11 @@ def main(argv: list[str] | None = None) -> int:
         term.leave()
         if app.conn in ("connected", "connecting"):
             print("Disconnecting…")
-            vpn.disconnect()
+            vpn.disconnect(app.engine)
+            if app.killswitch:
+                security.killswitch_disable()
+            if app.dns_protect and app._dns_service:
+                security.dns_restore(app._dns_service)
     return 0
 
 

@@ -10,9 +10,10 @@
 ![dependencies](https://img.shields.io/badge/dependencies-stdlib%20only-success)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-A terminal VPN hopper. Ferry lists free [**VPN Gate**](https://www.vpngate.net/)
-servers by country, connects one via the system **`openvpn`**, and shows live
-status — press a key to disconnect. No account, no signup. Just type `ferry`.
+A terminal VPN hopper. Type `ferry` and it **auto-connects to the best working
+free [VPN Gate](https://www.vpngate.net/) server anywhere** — probing candidates
+in parallel, preferring firewall-friendly relays, and failing over until one
+sticks. Or browse by country and pick your own. No account, no signup.
 
 Ferry is a from-scratch Python TUI in the look and feel of its sibling
 [Trawl](https://github.com/araidz/Trawl) — **zero third-party packages, stdlib only.**
@@ -22,14 +23,14 @@ Ferry is a from-scratch Python TUI in the look and feel of its sibling
 ```
   █▀▀ █▀▀ █▀▄ █▀▄ █ █   ~~~≈>
   █▀  █▄▄ █▀▄ █▀▄ ▀▄▀   <≈~~~
-  ● connected  Japan · 219.100.37.109 (JP) · 12m           auto-reconnect on
-  ──────────────────────────────────────────────────────────────────────────
-    ★ Favorites (2)      ╭─ Japan · score ────────────────────────────── (48) ─╮
-  ▌ Japan (48)           │ ❯ public-vpn-153     tcp:443   10 ms  248 Mbps JP ★ │
-    Korea Republic of…   │   vpn441877979       udp:1479  22 ms  180 Mbps JP   │
-    United States (2)    │   ...                                               │
-    Australia (1)        ╰─────────────────────────────────────────────────────╯
-  ↑↓ server · ↵ connect · f favorite · ← back · S sort · ? keys · q quit
+
+  ● connected   Japan · 219.100.37.109 (JP) · 12m       auto-reconnect
+  ──────────────────────────────────────────────────────────────────
+  Japan   48 servers · sort: score
+  ❯ public-vpn-153   tcp:443    10 ms   248 Mbps  ★
+    vpn441877979     udp:1479   22 ms   180 Mbps
+    …
+  ↑↓ move · ↵ connect · ← back · f fav · d disconnect · ? keys · q quit
 ```
 
 ## Requirements
@@ -61,30 +62,35 @@ Needs `openvpn` (`brew install openvpn`). Or run without building: `python3 -m f
 
 ## Usage
 
-`ferry` opens to a country rail beside a servers panel. Pick a country, pick a
-server, press Enter to connect. **openvpn runs as root, so ferry asks for your
-`sudo` password once at launch** and keeps that ticket warm for the session —
-connecting and disconnecting never prompt again.
+`ferry` opens a list of countries. Move with `↑ ↓`, press `↵` to open a country,
+then `↵` on a server to connect. Don't care which one? Press **`c`** and ferry
+auto-connects the best working server anywhere — probing candidates in parallel,
+preferring firewall-friendly relays, and failing over until one sticks.
 
-On a restrictive network (blocked VPN ports), prefer a relay whose transport
-shows **green** — `tcp:443` or `tcp:995` masquerade as HTTPS/POP3S and slip
-through most firewalls. Odd high ports (what you'll often see first) are the
-ones that get dropped.
+Press `d` to disconnect without leaving ferry, or just pick another server — even
+in a different country — and ferry switches over. `q` quits and tears down the tunnel.
+
+**openvpn runs as root, so ferry asks for your `sudo` password once at launch**
+and keeps that ticket warm for the session — connecting and disconnecting never
+prompt again.
+
+On a restrictive network, prefer a relay whose transport shows **green** —
+`tcp:443` or `tcp:995` masquerade as HTTPS/POP3S and slip through most firewalls.
+Ferry already sorts those first.
 
 | Key | Action |
 | --- | --- |
-| `↑ ↓` | move within the focused pane |
-| `→` | browse a country's servers |
-| `Enter` (on a country) | **auto-connect** the best working server, trying others if one stalls |
-| `Enter` (on a server) | connect that server, falling back to the rest of the country if it stalls |
-| `←` / `b` | back |
-| `d` | disconnect |
+| `↑ ↓` | move |
+| `↵` | open a country · connect a server |
+| `←` / `b` | back to the country list |
+| `c` | **auto-connect** the best working server anywhere |
+| `d` | disconnect (ferry keeps running) |
 | `f` | favorite / unfavorite a server (pinned under ★ Favorites) |
+| `r` | refresh the server list |
 | `S` | cycle sort — score / ping / speed |
 | `a` | toggle auto-reconnect (relaunch if the tunnel drops) |
-| `s` | show the connection status view |
-| `r` | refresh the server list |
-| `?` keys · `q` | quit (disconnects any active tunnel) |
+| `?` | keys |
+| `q` | quit (disconnects any active tunnel) |
 
 ## How it works
 
@@ -95,6 +101,13 @@ self-contained `.ovpn`, writes it under Application Support, and launches
 that log for the completed handshake and does one exit-IP lookup as proof the
 traffic really routes through the tunnel. Disconnecting is `sudo kill` of the
 daemon (openvpn tears its routes down on `SIGTERM`).
+
+**Censored networks:** some ISPs (e.g. UAE/Etisalat) DNS-blackhole VPN sites and
+RST-inject any TLS handshake naming a blocked host. Ferry defeats both with
+stdlib only — it resolves names over DNS-over-HTTPS and sends the TLS ClientHello
+in small TCP segments so the DPI can't read the SNI. Certificates are still fully
+verified, so this changes only *how* the bytes arrive, not *who* is trusted. The
+plain path is tried first, so open networks are unaffected.
 
 State lives in `~/Library/Application Support/Ferry/`:
 `servers.json` (cached list), `state.json` (favorites / sort / auto-reconnect),
@@ -110,15 +123,16 @@ routing and no Windows/Linux support.
 
 **What's available:** VPN Gate's free pool is what you get — roughly 100
 volunteer relays across ~10–15 countries at any moment, weighted toward Asia
-(Japan, Korea), and it rotates. Ferry shows the current pool; press `r` (while
-you can reach vpngate — i.e. already connected) to pull the latest. There is no
-fixed country list to expand: the servers are whoever is volunteering right now.
+(Japan, Korea), and it rotates. Ferry shows the current pool; press `r` to pull
+the latest (the DPI-bypass above keeps this working even on a filtered network).
+There is no fixed country list to expand: the servers are whoever is volunteering right now.
 
 ## Privacy
 
 VPN Gate relays are volunteer-run and public — good for casual use, not for
 anything sensitive. Ferry talks only to VPN Gate (server list), the relay you
-pick, and one IP-echo service (exit-IP check).
+pick, one IP-echo service (exit-IP check), and — only when a name won't resolve
+or a site is blocked — a public DNS-over-HTTPS resolver (Cloudflare, then Google).
 
 ## Credits
 

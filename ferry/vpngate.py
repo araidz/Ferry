@@ -19,10 +19,9 @@ from __future__ import annotations
 import base64
 import csv
 import json
-import urllib.request
 from dataclasses import asdict, dataclass
 
-from . import STATE_DIR
+from . import STATE_DIR, net
 
 API = "https://www.vpngate.net/api/iphone/"
 UA = "Mozilla/5.0"  # vpngate serves an empty body to a blank User-Agent
@@ -89,9 +88,7 @@ def parse(text: str) -> list[Server]:
 
 
 def fetch(timeout: float = 20.0) -> list[Server]:
-    req = urllib.request.Request(API, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return parse(r.read().decode("utf-8", "replace"))
+    return parse(net.get(API, timeout, headers={"User-Agent": UA}).decode("utf-8", "replace"))
 
 
 def load_cache() -> list[Server]:
@@ -119,3 +116,24 @@ def save_cache(servers: list[Server]) -> None:
         CACHE.write_text(json.dumps([asdict(s) for s in servers]))
     except OSError:
         pass
+
+
+class VPNGate:
+    """VPN Gate free relay provider — 3,200+ volunteer OpenVPN servers."""
+
+    name = "VPN Gate"
+
+    def fetch(self, timeout: float = 20.0) -> list[Server]:
+        return fetch(timeout)
+
+    def available(self) -> bool:
+        return bool(net.resolve("www.vpngate.net"))
+
+
+def composite_score(s: Server) -> float:
+    """Higher = better. Combines score, speed, ping, port friendliness."""
+    score_norm = s.score / 1e6
+    speed_norm = min(s.speed / 1e9, 1.0)
+    ping_norm = 1.0 - min((s.ping or 500) / 500, 1.0)
+    port_bonus = 0.2 if s.friendly else 0
+    return score_norm + speed_norm + ping_norm + port_bonus
